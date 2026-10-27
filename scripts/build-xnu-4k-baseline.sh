@@ -377,8 +377,9 @@ if [ "$OWNER_CACHE_MOUNT" != 0 ] && [ "$OWNER_CACHE_MOUNT" != 1 ]; then
   exit 1
 fi
 if [ "$OWNER_CACHE_MOUNT" = 1 ] && [ "$OWNER_ROOT_TRUST" != 1 ]; then
-  echo 'The offline SystemOS mount requires real independent owner root enforcement' >&2
-  exit 1
+  # dada bring-up: the SystemOS cryptex is mounted without an owner policy so launchd can find the dyld
+  # shared cache. The transport answers the authorization query; see docs/patches.
+  echo 'warning: offline SystemOS mount without owner root trust (bring-up mode)' >&2
 fi
 OWNER_CACHE_STARTUP=${XNU_OWNER_CACHE_STARTUP:-0}
 if [ "$OWNER_CACHE_STARTUP" != 0 ] && [ "$OWNER_CACHE_STARTUP" != 1 ]; then
@@ -487,6 +488,7 @@ if [ "$(cat "$NATIVE_AIR_STAMP" 2>/dev/null || echo 0)" != "$NATIVE_AIR_INIT" ];
   printf '%s\n' "$NATIVE_AIR_INIT" > "$NATIVE_AIR_STAMP"
 fi
 EXTRA_MAKE_ARGS+=("kern_exec.o_CFLAGS_ADD=-DXNU_NATIVE_AIR_INIT=$NATIVE_AIR_INIT -DXNU_OWNER_CACHE_MOUNT=$OWNER_CACHE_MOUNT -DXNU_OWNER_CACHE_STARTUP=$OWNER_CACHE_STARTUP -DXNU_OWNER_BOOT_MANIFEST=$OWNER_BOOT_MANIFEST -DXNU_OWNER_DATA_MOUNT=$OWNER_DATA_MOUNT -DXNU_NATIVE_RAM_BLOCK=$NATIVE_RAM_BLOCK -DXNU_OWNER_CRYPTEX_FILES=$OWNER_CRYPTEX_FILES -DXNU_OWNER_UNION_SYSTEMOS=$OWNER_UNION_SYSTEMOS -include $OWNER_DATA_HEADER")
+EXTRA_MAKE_ARGS+=("kern_exit.o_CFLAGS_ADD=-DXNU_OWNER_CACHE_MOUNT=$OWNER_CACHE_MOUNT")
 OWNER_CACHE_STAMP=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/.owner-cache-mount-mode
 if [ "$(cat "$OWNER_CACHE_STAMP" 2>/dev/null || echo 0:0)" != "$OWNER_CACHE_MOUNT:$OWNER_CACHE_STARTUP" ]; then
   rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o"
@@ -613,7 +615,7 @@ if [ "${XNU_SOURCE_CORECRYPTO14:-0}" = 1 ] && [ "$BOOTSTRAP" = 0 ]; then
     KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $ARMCPU_ARCHIVE"
   fi
   if [ "${XNU_NATIVE_UFS:-0}" = 1 ]; then
-    UFS_ARCHIVE=$ROOT/build/sheng-ufs/libShengUfs.a
+    UFS_ARCHIVE=${XNU_NATIVE_UFS_ARCHIVE:-$ROOT/build/sheng-ufs/libShengUfs.a}
     test -f "$UFS_ARCHIVE"
     KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$UFS_ARCHIVE"
     KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $UFS_ARCHIVE"

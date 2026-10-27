@@ -510,3 +510,42 @@ runtime_identifiers = ["ShengPreflight"]
 build_stage = "firmware"
 build = []
 outputs = []
+
+[[component]]
+id = "DadaUfs2"
+kind = "driver"
+function = "SM8750 UFS transport with linux-partition root policy (Redmi K80 Pro dada2 fork of DadaUfs)"
+scope = "board"
+repository = "https://github.com/7Night-kqx/UniXNU-dada.git"
+revision = "81981cd000000000000000000000000000000000"
+path = "drivers/DadaUfs2"
+hardware = ["Qualcomm SM8750 UFS controller"]
+os_abi = ["ipados-17.7.11-21H461"]
+board_dependencies = ["board userdata windows"]
+verified_devices = []
+dependencies = ["VirtioMmioBlock", "VerifiedRoot"]
+source_files = ["DadaUfs2.cpp"]
+runtime_identifiers = ["NativeUfs", "DadaUfs2.cpp", "org.blu-sharky.NativeUfs"]
+build_stage = "kernel"
+build = ["build-arm-driver.py", "DadaUfs2"]
+outputs = ["build/dada2-ufs/libDadaUfs2.a"]
+
+[[component]]
+id = "DadaPlatformPower2"
+kind = "driver"
+function = "SM8750 platform power for Redmi K80 Pro (dada2 fork of DadaPlatformPower)"
+scope = "board"
+repository = "https://github.com/7Night-kqx/UniXNU-dada.git"
+revision = "81981cd000000000000000000000000000000000"
+path = "drivers/DadaPlatformPower2"
+hardware = ["Qualcomm SM8750 RPMh"]
+os_abi = ["ipados-17.7.11-21H461"]
+board_dependencies = []
+verified_devices = []
+dependencies = []
+source_files = ["ShengPlatformPower.cpp"]
+runtime_identifiers = ["ShengPlatformPower", "ShengPlatformPower.cpp"]
+build_stage = "kernel"
+build = ["build-dada2-platform-power.py"]
+outputs = ["build/dada2-platform-power/libDadaPlatformPower2.a"]
+

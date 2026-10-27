@@ -8,7 +8,7 @@ OBJ = 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837'
 def defined_names(paths, global_only):
     """Defined symbol names of Mach-O files and archives."""
     names = set()
-    paths = [str(path) for path in paths]
+    paths = [str(path) for path in paths if Path(path).is_file()]
     for start in range(0, len(paths), 200):
         command = ['xcrun', 'nm', *(['-g'] if global_only else []), '-U', '-j', *paths[start:start + 200]]
         names |= {line.strip() for line in subprocess.check_output(command, text=True).splitlines() if line.startswith('_')}

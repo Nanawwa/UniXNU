@@ -37,14 +37,23 @@ def check_args(arguments):
     return line
 
 
-def check_native_root(kernel, arguments):
-    """Refuse the known bare-metal AMFI panic before the volume is written."""
+def check_native_root(ctx, kernel, arguments):
+    """Refuse the known bare-metal AMFI panic before the volume is written.
+
+    The PMGR requirements below exist because the prelinked AppleMobileFileIntegrity asks the policy
+    manager for every decision. A board that prelinks no AMFI cannot reach that panic, so the check
+    applies only when AMFI is one of the resolved prelink roots (dada, for example, prelinks none and
+    publishes its UFS root without a PMGR).
+    """
     values = {}
     for argument in arguments:
         key, separator, value = argument.partition('=')
         if separator:
             values.setdefault(key, []).append(value)
     if '1' not in values.get('native-ufs-root', []):
+        return
+    roots = ctx.board.get('kernel', {}).get('prelink', {}).get('roots', [])
+    if 'com.apple.driver.AppleMobileFileIntegrity' not in roots:
         return
     if values.get('sheng-pmgr') != ['2']:
         raise Error('native UFS root boot needs exactly one sheng-pmgr=2; the unchanged target AMFI otherwise panics with No PMGR')
@@ -96,7 +105,7 @@ def build(ctx, kernel=None):
     arguments = [item for item in spec.get('kernel_args', []) if item.split('=', 1)[0] not in names] + extra
     line = check_args(arguments)
     log(f'kernel args: {line}')
-    check_native_root(kernel, arguments)
+    check_native_root(ctx, kernel, arguments)
     owner_trust = getattr(args, 'owner_trust_cache', None)
     trust = expand(owner_trust or args.trust_cache) if (owner_trust or getattr(args, 'trust_cache', None)) else None
     if trust:
