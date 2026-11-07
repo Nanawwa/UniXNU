@@ -106,6 +106,8 @@ def build(ctx, kernel=None):
     spec = ctx.board.get('payload')
     if not spec:
         raise Error('board.toml has no [payload]')
+    if spec.get('panic_ramoops') and not spec.get('panic_screen'):
+        raise Error('board.toml [payload] panic_ramoops needs panic_screen = true')
     args = ctx.args
     kernel = expand(kernel or getattr(args, 'kernel', None) or ctx.work / 'kernel/kernel.macho')
     if not kernel.is_file():
@@ -161,11 +163,37 @@ def build(ctx, kernel=None):
     payloads = stage / 'EFI/UniXNU/Payloads'
     payloads.mkdir(parents=True)
     shutil.copyfile(kernel, payloads / 'kernel.macho')
+    if spec.get('entry_probe_sctlr_value') is not None:
+        # Bisect SCTLR_EL1_DEFAULT: the kernel writes it with msr right before
+        # the MMU turns on, and execution stops there on this firmware. Lowering
+        # only x0 makes the following cmp fail, so b.ne +4 lands on the stage-3
+        # site the entry probe instruments -- one boot per candidate value.
+        script = ctx.tree / 'scripts/set-sctlr-value.py'
+        if not script.is_file():
+            raise Error(f'{script} missing')
+        run(['python3', str(script), str(payloads / 'kernel.macho'),
+             str(spec['entry_probe_sctlr_value']), '-o', str(payloads / 'kernel.macho')],
+            cwd=ctx.tree, log_file=ctx.logs / 'payload-sctlr.log')
     # The entry probe (stage bars, optional reset) is wanted with either setting; the panic screen is only one part of it.
     if spec.get('panic_screen') or spec.get('entry_probe_reset_delay'):
         probe = (['--reset-delay', str(int(spec['entry_probe_reset_delay']))]
                  if spec.get('entry_probe_reset_delay') else ['--no-reset'])
         screen = ['--panic-screen'] if spec.get('panic_screen') else []
+        if spec.get('entry_probe_reset_spin'):
+            # Stage 3 waits by iteration count instead of cntpct_el0, so a
+            # trapped counter register cannot look like a hang.
+            probe.append('--reset-spin')
+        if spec.get('entry_probe_after_mmu_band'):
+            # Paint one more band at the isb right after msr sctlr_el1. A band
+            # there proves the CPU fetched instructions with the MMU on; no band
+            # means the first virtual fetch faulted.
+            probe.append('--after-mmu-band')
+        if spec.get('panic_ramoops'):
+            # The panic text goes into the Android ramoops console zone and the phone resets itself, so the
+            # log is read back from /sys/fs/pstore after Android boots instead of photographed.
+            screen += ['--panic-ramoops', str(spec['panic_ramoops']),
+                       '--panic-ramoops-size', str(spec.get('panic_ramoops_size', '0x200000')),
+                       '--panic-ramoops-delay', str(int(spec.get('panic_ramoops_delay', 5)))]
         if spec.get('entry_probe_reset_delay') and spec.get('entry_probe_reset_after'):
             # Stage 4 in place of stage 3: reset after the Nth call to SYMBOL in FUNCTION.
             probe += ['--reset-after', spec['entry_probe_reset_after'], '--in', spec.get('entry_probe_reset_in', '_arm_init'),

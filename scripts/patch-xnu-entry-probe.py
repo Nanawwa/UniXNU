@@ -17,6 +17,11 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         their format string on the
                                         kernel's own frame buffer mapping and
                                         stops (scripts/xnu-panic-screen.c).
+                                        --panic-ramoops PHYS also writes the
+                                        text into the Android ramoops console
+                                        zone at PHYS and resets through PSCI,
+                                        so the log is read from /sys/fs/pstore
+                                        after Android boots (no photo).
                                         --no-reset leaves out stages 3 and 4.
   stage 4 (--reset-after SYMBOL)        the same wait and reset, but placed after
                                         the call to SYMBOL in --in FUNCTION (the
@@ -44,13 +49,15 @@ MMU_ENABLE_VA = 0xFFFFFFF00B9D2330   # msr SCTLR_EL1, x0
 AFTER_MMU_VA = 0xFFFFFFF00B9D2350    # mov x0, #0x300000
 PANIC_VA = 0xFFFFFFF00BF69B04      # _panic
 VINFO_VA = 0xFFFFFFF00C0A2970      # _vinfo
-PANIC_CAVE_END = 0xFFFFFFF00B9D0FF0
 CAVE_SIZE = 0x60
-CAVES = {1: 0xFFFFFFF00B9D0500, 2: 0xFFFFFFF00B9D0560, 3: 0xFFFFFFF00B9D05C0, 4: 0xFFFFFFF00B9D0620}
+CAVES = {1: 0xFFFFFFF00B9D0500, 2: 0xFFFFFFF00B9D0560, 3: 0xFFFFFFF00B9D05C0,
+         4: 0xFFFFFFF00B9D0620, 5: 0xFFFFFFF00B9D0680, 6: 0xFFFFFFF00B9D06E0}
 TIMEBASE = 19200000
 
 PAINT = """
   ldr x1, [{args}, #0x28]
+  /* DarwinBoot flags a physical frame buffer with bit 0 of v_baseAddr: store to the aligned address. */
+  bic x1, x1, #1
   ldr x2, [{args}, #0x38]
   ldr x3, [{args}, #0x48]
   mul x2, x2, x3
@@ -72,6 +79,26 @@ SOURCES = {
     1: ".text\n.global _start\n_start:\n" + PAINT.format(args='x0', band=1, lo='0x00FF', hi='0xFF00') + "  b target\n",
     2: ".text\n.global _start\n_start:\n" + PAINT.format(args='x20', band=2, lo='0x00FF', hi='0xFFFF')
        + "  msr SCTLR_EL1, x0\n  b target\n",
+    5: ".text\n.global _start\n_start:\n" + PAINT.format(args='x20', band=4, lo='0xFF00', hi='0x00FF')
+       + "  isb\n  b target\n",
+    6: """.text
+.global _start
+_start:
+  mov x0, #0x300000
+  ldr x4, ={spin}
+1:
+  subs x4, x4, #1
+  b.ne 1b
+  movz w0, #0x0009
+  movk w0, #0x8400, lsl #16
+  mov x1, xzr
+  mov x2, xzr
+  mov x3, xzr
+  smc #0
+2:
+  wfe
+  b 2b
+""",
     3: """.text
 .global _start
 _start:
@@ -170,11 +197,12 @@ def find_call(data, symbols, function, name, occurrence):
     return hits[occurrence - 1]
 
 
-def assemble_c(source, va, workdir, symbols):
+def assemble_c(source, va, workdir, symbols, ramoops=None):
     """Build a freestanding C file for VA; returns (bytes, load address of the first byte, address of panic_screen).
 
     The linker may start .text a little after VA (it keeps the ELF headers in front), so the
-    load address is read back from the ELF and is what the caller must write the bytes to."""
+    load address is read back from the ELF and is what the caller must write the bytes to.
+    ramoops is (phys, delay seconds, zone bytes) for the panic log channel or None."""
     clang = shutil.which('clang') or '/opt/homebrew/opt/llvm/bin/clang'
     lld = shutil.which('ld.lld') or '/opt/homebrew/opt/llvm/bin/ld.lld'
     objcopy = shutil.which('llvm-objcopy') or '/opt/homebrew/opt/llvm/bin/llvm-objcopy'
@@ -193,15 +221,30 @@ def assemble_c(source, va, workdir, symbols):
         address = symbols.get(name)
         if address is None or address % width or not any(
                 base <= address and address + width <= base + size
-                for base, size, _, _ in SEGMENTS):
+                for base, size, _, _, _, _ in SEGMENTS):
             raise SystemExit(f'Missing or invalid diagnostic symbol {name}')
         definitions.append(f'-D{macro}={address:#x}UL')
     # Optional: the board's banner buffer for the panic message (kits/sheng/BootProgress.c); kernels without it get 0 (no copy).
     text = symbols.get('_boot_progress_panic_text')
     if text is not None:
-        if not any(base <= text and text + 256 <= base + size for base, size, _, _ in SEGMENTS):
+        if not any(base <= text and text + 256 <= base + size for base, size, _, _, _, _ in SEGMENTS):
             raise SystemExit('Invalid _boot_progress_panic_text')
         definitions.append(f'-DPANIC_TEXT={text:#x}UL')
+    # Optional: the driver's panic record writer (MiroUfs: the root partition's last blocks). Kernels without it get 0.
+    ufs_write = symbols.get('_native_ufs_panic_write')
+    if ufs_write is not None and any(base <= ufs_write < base + size for base, size, _, _, _, _ in SEGMENTS):
+        definitions.append(f'-DUFS_PANIC_WRITE={ufs_write:#x}UL')
+    if ramoops:
+        # The panic log channel writes into the ramoops zone through the kernel's own mapping service, and it
+        # has to have the message: both symbols are required, not optional.
+        io_map = symbols.get('_ml_io_map')
+        if io_map is None or not any(base <= io_map < base + size for base, size, _, _, _, _ in SEGMENTS):
+            raise SystemExit('panic ramoops needs _ml_io_map in the kernel')
+        if text is None:
+            raise SystemExit('panic ramoops needs _boot_progress_panic_text (the message it saves)')
+        phys, delay, zone = ramoops
+        definitions += [f'-DML_IO_MAP={io_map:#x}UL', f'-DPANIC_RAMOOPS={phys:#x}UL',
+                        f'-DPANIC_RAMOOPS_SIZE={zone:#x}UL', f'-DPANIC_RAMOOPS_DELAY={delay}UL']
     subprocess.run([clang, '--target=aarch64-none-elf', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
                     '-mgeneral-regs-only', '-fno-pic', '-mcmodel=tiny', '-Oz', f'-DVINFO={VINFO_VA:#x}UL',
                     *definitions, f'-I{font_dir}', '-c', source, '-o', obj], check=True)
@@ -252,22 +295,30 @@ def panic_common_entry(workdir, code, load):
 ROOT = Path(__file__).resolve().parents[1]
 
 
-SEGMENTS = []   # (vmaddr, vmsize, fileoff, filesize) of the kernel being patched
+SEGMENTS = []   # (vmaddr, vmsize, fileoff, filesize, segname, initprot) of the kernel being patched
+SECTIONS = []   # (addr, size) of its non-empty sections
 
 
 def load_segments(data):
-    """Read the Mach-O segment table; the file layout differs between kernel builds."""
+    """Read the Mach-O segment and section tables; the file layout differs between kernel builds."""
     magic, _, _, _, ncmds = struct.unpack_from('<IiiII', data, 0)
     if magic != 0xFEEDFACF:
         raise SystemExit('Not a 64-bit Mach-O')
     offset = 32
     SEGMENTS.clear()
+    SECTIONS.clear()
     for _ in range(ncmds):
         cmd, size = struct.unpack_from('<II', data, offset)
         if cmd == 0x19:
-            _, vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<16sQQQQ', data, offset + 8)
+            name, vmaddr, vmsize, fileoff, filesize, _, initprot, nsects, _ = struct.unpack_from(
+                '<16sQQQQIIII', data, offset + 8)
+            name = name.split(b'\0')[0].decode()
             if filesize:
-                SEGMENTS.append((vmaddr, vmsize, fileoff, filesize))
+                SEGMENTS.append((vmaddr, vmsize, fileoff, filesize, name, initprot))
+            for index in range(nsects):
+                _, _, addr, length = struct.unpack_from('<16s16sQQ', data, offset + 72 + index * 80)
+                if length:
+                    SECTIONS.append((addr, length))
         offset += size
 
 
@@ -288,14 +339,13 @@ def rebase(kernel, data):
     _panic and _vinfo come from the symbol table when the kernel has one (the plain source
     kernel does); the retained candidate layout is the unshifted case.
     """
-    global ENTRY_VA, START_FIRST_CPU, MMU_ENABLE_VA, AFTER_MMU_VA, PANIC_VA, VINFO_VA, PANIC_CAVE_END, CAVES
+    global ENTRY_VA, START_FIRST_CPU, MMU_ENABLE_VA, AFTER_MMU_VA, PANIC_VA, VINFO_VA, CAVES
     delta = unixthread_pc(data) - ENTRY_VA
     if delta:
         ENTRY_VA += delta
         START_FIRST_CPU += delta
         MMU_ENABLE_VA += delta
         AFTER_MMU_VA += delta
-        PANIC_CAVE_END += delta
         CAVES = {stage: va + delta for stage, va in CAVES.items()}
         PANIC_VA += delta
         VINFO_VA += delta
@@ -327,8 +377,43 @@ def rebase(kernel, data):
     return names
 
 
+def panic_cave(data, symbols, minimum):
+    """The largest zero padding at the end of an executable segment, as (start, end).
+
+    The panic screen outgrew the padding after the kernel entry once it also writes the ramoops record, so it
+    moves to a segment tail: everything after its last section and its last symbol. Both are checked:
+    an all-zero section would look like padding, and a symbol there would be overwritten code.
+
+    Every executable segment is a candidate and the largest cave wins. __TEXT_EXEC alone made the screen depend
+    on the kernel's own code size: the 2026-11-02 build grew the UFS driver by 0x480 and the screen, at 0xebe
+    bytes, no longer fitted. __KLD is mapped read-only executable for the whole boot like __TEXT_EXEC, and its
+    tail is set by the linker rather than by driver code."""
+    best = None
+    for vmaddr, vmsize, fileoff, filesize, name, initprot in SEGMENTS:
+        if not (initprot & 4):
+            continue
+        size = min(vmsize, filesize)
+        blob = data[fileoff:fileoff + size]
+        end = len(blob)
+        while end and blob[end - 1] == 0:
+            end -= 1
+        start = (vmaddr + end + 15) & ~15
+        stop = vmaddr + size
+        if stop - start < minimum:
+            continue
+        if any(start < addr + length and addr < stop for addr, length in SECTIONS):
+            continue
+        if any(start <= address < stop for address in symbols.values()):
+            continue
+        if best is None or stop - start > best[1] - best[0]:
+            best = (start, stop)
+    if best is None:
+        raise SystemExit('no zero padding in an executable segment for the panic screen')
+    return best
+
+
 def file_offset(va):
-    for vmaddr, vmsize, fileoff, filesize in SEGMENTS:
+    for vmaddr, vmsize, fileoff, filesize, _, _ in SEGMENTS:
         if vmaddr <= va < vmaddr + min(vmsize, filesize):
             return fileoff + (va - vmaddr)
     raise SystemExit(f'{va:#x} is not in a file-backed segment of this kernel')
@@ -360,12 +445,25 @@ def main():
     parser.add_argument('--reset-after', metavar='SYMBOL', help='place the reset after this call in arm_init instead of stage 3')
     parser.add_argument('--reset-before', action='store_true', help='reset at the call site before invoking SYMBOL (requires --reset-after)')
     parser.add_argument('--panic-screen', action='store_true', help='draw panic() messages on the screen')
+    parser.add_argument('--panic-ramoops', type=lambda value: int(value, 0), default=0, metavar='PHYS',
+                        help='also write the panic text into the Android ramoops console zone at PHYS and reset')
+    parser.add_argument('--panic-ramoops-size', type=lambda value: int(value, 0), default=0x200000, metavar='BYTES',
+                        help='size of that console zone (default 0x200000)')
+    parser.add_argument('--panic-ramoops-delay', type=int, default=5, metavar='SECONDS',
+                        help='wait this many seconds before the reset (default 5)')
+    parser.add_argument('--reset-spin', action='store_true',
+                        help='stage 3 waits by fixed iteration count instead of cntpct_el0, '
+                             'so a trapped counter register cannot fake a hang')
+    parser.add_argument('--after-mmu-band', action='store_true',
+                        help='paint an extra band at the isb right after msr sctlr_el1: proves the MMU-on fetch survived')
     parser.add_argument('--no-reset', action='store_true', help='no reset probe at all')
     parser.add_argument('--occurrence', type=int, default=1, help='which call to SYMBOL (1 = first)')
     parser.add_argument('--in', dest='function', default='_arm_init', help='function that makes the call (default _arm_init)')
     args = parser.parse_args()
     if args.reset_before and not args.reset_after:
         raise SystemExit('--reset-before requires --reset-after')
+    if args.panic_ramoops and not args.panic_screen:
+        raise SystemExit('--panic-ramoops needs --panic-screen')
     data = bytearray(args.kernel.read_bytes())
     load_segments(data)
     kernel_names = rebase(args.kernel, data)
@@ -392,12 +490,21 @@ def main():
         sites.append((call_va, 4, {'callee': callee, 'target': call_va + 4}))
         description = f'stage 4 reset {"before" if args.reset_before else "after"} call #{args.occurrence} to {args.reset_after} in {args.function} (at {call_va:#x})'
     else:
-        sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
+        stage = 6 if getattr(args, 'reset_spin', False) else 3
+        sites.append((AFTER_MMU_VA, stage, {'target': AFTER_MMU_VA + 4}))
+    if getattr(args, 'after_mmu_band', False):
+        band_va = MMU_ENABLE_VA + 4          # the isb right after the msr
+        sites.append((band_va, 5, {'target': band_va + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
-            source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(ticks=TIMEBASE * args.reset_delay)
+            if stage == 4 and args.reset_before:
+                source = RESET_BEFORE
+            else:
+                source = SOURCES[stage].format(
+                    ticks=TIMEBASE * args.reset_delay,
+                    spin=max(1, int(args.reset_delay)) * 300000000)
             code = assemble(source, CAVES[stage], symbols, Path(tmp))
             if len(code) > CAVE_SIZE:
                 raise SystemExit(f'Stage {stage} code is too large')
@@ -405,15 +512,18 @@ def main():
     for site, stage, _ in sites:
         struct.pack_into('<I', data, file_offset(site), branch(site, CAVES[stage]))
     if args.panic_screen:
-        # Right after the last probe cave in use, so the padding is shared as tightly as possible.
-        PANIC_CAVE = max(CAVES[stage] for _, stage, _ in sites) + CAVE_SIZE
-        if word(PANIC_VA) in (0, 0xFFFFFFFF) or any(data[file_offset(PANIC_CAVE):file_offset(PANIC_CAVE_END)]):
-            raise SystemExit('panic() or the panic screen padding is not as expected')
+        # An executable segment tail, after its last section and symbol: the entry padding is too small for the
+        # screen and the ramoops writer together.
+        # Whether the screen actually fits is decided after it is assembled, where the message gives both sizes.
+        cave, cave_end = panic_cave(data, kernel_names, 0x1000)
+        if word(PANIC_VA) in (0, 0xFFFFFFFF):
+            raise SystemExit('panic() is not as expected')
+        ramoops = (args.panic_ramoops, args.panic_ramoops_delay, args.panic_ramoops_size) if args.panic_ramoops else None
         with tempfile.TemporaryDirectory() as tmp:
-            code, load, entry = assemble_c(ROOT / 'scripts/xnu-panic-screen.c', PANIC_CAVE, Path(tmp), kernel_names)
+            code, load, entry = assemble_c(ROOT / 'scripts/xnu-panic-screen.c', cave, Path(tmp), kernel_names, ramoops)
             common_entry = panic_common_entry(Path(tmp), code, load)
-        if load + len(code) > PANIC_CAVE_END:
-            raise SystemExit(f'panic screen is {len(code):#x} bytes at {load:#x}, the padding ends at {PANIC_CAVE_END:#x}')
+        if load + len(code) > cave_end:
+            raise SystemExit(f'panic screen is {len(code):#x} bytes at {load:#x}, the padding ends at {cave_end:#x}')
         if any(data[file_offset(load):file_offset(load) + len(code)]):
             raise SystemExit(f'Padding at {load:#x} is not empty')
         data[file_offset(load):file_offset(load) + len(code)] = code
@@ -423,6 +533,8 @@ def main():
             raise SystemExit('Common panic funnel is missing; refuse a partially covered panic screen')
         struct.pack_into('<I', data, file_offset(common), branch(common, common_entry))
         description += f', panic screen ({len(code):#x} bytes at {entry:#x}; common funnel at {common:#x})'
+        if ramoops:
+            description += f', ramoops at {args.panic_ramoops:#x} then a PSCI reset {args.panic_ramoops_delay} s later'
     args.kernel.write_bytes(data)
     print(f'patched {args.kernel.name}: stage 1 blue bar, stage 2 magenta bar, {description}')
 
